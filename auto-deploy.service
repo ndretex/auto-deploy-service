@@ -1,0 +1,21 @@
+[Unit]
+Description=Auto-Deploy Service - Automated Git Repository Deployment
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/auto-deploy-service/auto-deploy.py
+WorkingDirectory=/root/auto-deploy-service
+StandardOutput=journal
+StandardError=journal
+User=root
+Restart=always
+RestartSec=10
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target

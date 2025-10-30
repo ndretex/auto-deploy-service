@@ -1,0 +1,89 @@
+# Auto-Deploy Service Configuration
+# This file defines all projects to monitor and auto-deploy
+
+# Global settings
+global:
+  # How often to check for updates (in seconds)
+  check_interval: 300  # 5 minutes
+  
+  # Log directory (relative to service directory or absolute path)
+  log_directory: /var/log/auto-deploy
+  
+  # Enable notifications
+  notifications:
+    enabled: false
+    # Webhook URL for notifications (Slack, Discord, etc.)
+    webhook_url: ""
+
+# Projects to monitor
+projects:
+  - name: "Example Project 1"
+    # Absolute path to the project directory
+    path: /path/to/your/project
+    
+    # Git branch to monitor
+    branch: main
+    
+    # Deployment method: docker-compose, systemd, or custom
+    deploy_method: docker-compose
+    
+    # Docker Compose settings (if deploy_method is docker-compose)
+    docker_compose:
+      service_name: app
+      # Additional docker-compose flags
+      build_flags: "--build"
+      up_flags: "-d"
+    
+    # Pre-deployment commands (optional)
+    pre_deploy: []
+    
+    # Post-deployment commands (optional)
+    post_deploy:
+      - docker system prune -f
+    
+    # Enable/disable this project
+    enabled: true
+
+  - name: "Example Project 2"
+    path: /path/to/another/project
+    branch: main
+    deploy_method: docker-compose
+    
+    docker_compose:
+      service_name: app
+      build_flags: "--build"
+      up_flags: "-d"
+    
+    pre_deploy: []
+    
+    post_deploy:
+      - docker system prune -f
+    
+    enabled: true
+
+# Example of a systemd-based deployment
+#  - name: "Example Systemd Service"
+#    path: /opt/my-service
+#    branch: main
+#    deploy_method: systemd
+#    
+#    systemd:
+#      service_name: my-service
+#    
+#    pre_deploy:
+#      - pip install -r requirements.txt
+#    
+#    post_deploy: []
+#    
+#    enabled: false
+
+# Example of a custom deployment method
+#  - name: "Custom Deployment"
+#    path: /opt/custom-app
+#    branch: main
+#    deploy_method: custom
+#    
+#    custom:
+#      deploy_script: /opt/custom-app/deploy.sh
+#    
+#    enabled: false
