@@ -1,20 +1,20 @@
 [Unit]
-Description=Auto-Deploy Service - Automated Git Repository Deployment
-After=network-online.target docker.service
+Description=Auto-Deploy Service - Automated Git Repository Deployment (venv)
+After=network-online.target
 Wants=network-online.target
-Requires=docker.service
 
 [Service]
+# Run the auto-deploy Python from the repository virtualenv so host paths
+# (project directories) are available to the service.
 Type=simple
-ExecStart=/usr/bin/python3 /root/auto-deploy-service/auto-deploy.py
+Restart=always
+RestartSec=5
+ExecStart=/root/auto-deploy-service/.venv/bin/python /root/auto-deploy-service/auto-deploy.py /root/auto-deploy-service/config.yaml
+ExecStop=/bin/sh -c '/root/auto-deploy-service/.venv/bin/python -c "import sys; sys.exit(0)" || true'
 WorkingDirectory=/root/auto-deploy-service
 StandardOutput=journal
 StandardError=journal
 User=root
-Restart=always
-RestartSec=10
-
-# Environment
 Environment="PYTHONUNBUFFERED=1"
 
 [Install]

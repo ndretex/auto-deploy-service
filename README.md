@@ -1,77 +1,144 @@
 # Auto-Deploy Service
 
-A centralized service that monitors multiple Git repositories for updates and automatically deploys changes.
+A centralized Python service that watches one or more Git repositories, pulls updates when branches fall behind, and redeploys code through Docker Compose, systemd services, or custom scripts. The same process also exposes a lightweight Flask monitoring UI (with Chart.js graphs) from `monitoring/templates` + `monitoring/static` and publishes health data that drives downtime/deploy charts.
+
+## Project Layout
+
+- `auto-deploy.py` – main engine + monitor runner that loads `config.yaml`, checks Git status, redeploys, and runs the Flask web UI on the configured `global.web_port`.
+- `auto-deploy.service` – systemd unit that expects a Python virtualenv at `.venv` inside the repo (`ExecStart=.venv/bin/python auto-deploy.py config.yaml`).
+- `install.sh` – convenience installer that installs Python system packages, makes the script executable, creates `/var/log/auto-deploy`, and registers the service.
+- `config.example.yaml` – canonical configuration template.
+- `config.yaml` – user configuration (copy from the example and edit per environment).
+- `requirements.txt` – dependencies (`PyYAML`, `requests`, `Flask`, `docker`).
+- `monitoring/templates/index.html` + `monitoring/static/monitor.js` – served by Flask; drives the status table, refresh control, and Chart.js graphs.
+- `logs/` – optional development directory for run records outside the system log.
 
 ## Features
 
-- ✅ **Multi-Project Support**: Monitor and deploy multiple projects from a single service
-- ✅ **Flexible Deployment**: Supports Docker Compose, systemd, and custom deployment methods
-- ✅ **Git-Based Updates**: Automatically detects when local branch is behind remote
-- ✅ **Smart Deployment**: Only deploys when changes are detected
-- ✅ **Logging**: Centralized logging with timestamps and rotation
-- ✅ **Notifications**: Optional webhook notifications (Slack, Discord, etc.)
-- ✅ **Safe Updates**: Stashes uncommitted changes before pulling
-- ✅ **Pre/Post Hooks**: Run custom commands before and after deployment
+- ✅ **Multi-project orchestration**: configure as many repositories as you need and choose docker-compose, systemd, or custom scripts per entry.
+- ✅ **Smart Git detection**: the engine fetches remotes, compares merge bases, stashes local changes if needed, and redeploys only when the local branch is strictly behind.
+- ✅ **Health monitoring**: optional `projects[].health` block supports HTTP probes (`url` + `expected_status`), container-centric checks, or custom scripts; results land in both the UI table and the downtime/deployment aggregates.
+- ✅ **Flask + Chart.js UI**: the embedded interface polls `/api/health`, `/api/downtime`, and `/api/deployments`, renders a status table, and draws downtime/deployment bar charts without bundlers.
+- ✅ **Runtime modes**: run the engine alone (`--mode=engine`) or run the engine + monitor (`--mode=all`, the default).
+- ✅ **Notifications**: webhook payloads include both `text` and `content` (compatible with Slack and Discord) and fire when deployments succeed/fail, Git checks error, or divergence is detected.
+- ✅ **History retention**: downtime and deployment charts are built from retention-configurable history buffers (`global.history_retention_days`).
+- ✅ **Logging & rotation**: logs land in `global.log_directory` (default `/var/log/auto-deploy/auto-deploy.log`) with a `TimedRotatingFileHandler` that keeps `global.log_retention_days` worth of files.
 
 ## Quick Start
 
-### Installation
+### Prerequisites
 
-1. **Install dependencies**
-   ```bash
-   cd /root/auto-deploy-service
-   pip3 install -r requirements.txt
-   ```
+1. Linux host with Python 3.11+ (and systemd if you plan to install the service), Git, and Docker if you deploy Compose projects.
+2. Network access to all monitored repositories, webhooks, and health probes.
+3. A Python virtualenv inside the repo (`python3 -m venv .venv`) keeps dependencies isolated.
 
-2. **Configure projects** (edit `config.yaml`)
-   ```bash
-   nano config.yaml
-   ```
+### Prepare the environment
 
-3. **Test manually first**
-   ```bash
-   python3 auto-deploy.py --once
-   ```
+```bash
+cd /root/auto-deploy-service
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp config.example.yaml config.yaml
+# edit config.yaml to describe your projects, branches, and webhook URLs
+nano config.yaml
+```
 
-4. **Install as systemd service**
-   ```bash
-   chmod +x install.sh
-   sudo ./install.sh
-   ```
+### Try the engine manually
+
+```bash
+python3 auto-deploy.py --once
+```
+
+Add `--mode=engine` to skip the Flask UI and health scheduler when you only need the deploy loop, or `--mode=all` (default) to keep both pieces active.
+
+### Install as a systemd service
+
+```bash
+chmod +x install.sh
+sudo ./install.sh
+```
+
+`install.sh` installs `python3-yaml` + `python3-requests`, creates `/var/log/auto-deploy`, copies `auto-deploy.service` into `/etc/systemd/system`, reloads systemd, and enables `auto-deploy.service`. The bundled unit points at `.venv/bin/python`, so create that virtualenv and install `requirements.txt` before running the installer or edit the service file to use your preferred interpreter path.
+
+### Docker Compose (optional)
+
+```bash
+cd /root/auto-deploy-service
+docker compose up -d --build
+```
+
+- `auto-deploy-engine`: runs the Git-check/deploy loop.
+- `auto-deploy-monitor`: serves the monitoring UI built from `monitoring/templates` + `monitoring/static`.
+
+```bash
+docker compose down
+```
+
+## Runtime modes
+
+`auto-deploy.py` accepts an optional `--mode=<all|engine>` flag (default `all`).
+
+- `--mode=all`: runs the engine loop, starts the Flask UI, and kicks off the health scheduler.
+- `--mode=engine`: skips the Flask/health components when you only care about the deploy engine (useful for cron jobs or containerized deployments without the UI).
+
+## Monitoring UI
+
+The Flask app exposes the following endpoints:
+
+- `/` → `monitoring/templates/index.html` (status table, refresh button, downtime/deployment canvases).
+- `/static/monitor.js` → polls `/api/health`, formats ISO timestamps, and feeds Chart.js.
+- `/api/health` → current health status per project.
+- `/api/downtime?range=7d|3d|24h|1h` → downtime percentage buckets used by the downtime chart.
+- `/api/deployments?range=...` → deployment counts per bucket.
+
+Chart.js is loaded from `https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js`, the client refreshes every 30 seconds, and a manual refresh button pulls the latest health data. There is no authentication, so expose this UI only on trusted networks or behind a proxy.
 
 ## Configuration
 
-Edit `config.yaml` to configure your projects:
-
 ```yaml
 global:
-  check_interval: 300  # Check every 5 minutes
+  check_interval: 300                  # seconds between check cycles
+  web_port: 8000                       # Flask UI port (change to suit your network)
   log_directory: /var/log/auto-deploy
+  log_retention_days: 7
+  history_retention_days: 7
   notifications:
     enabled: false
-    webhook_url: ""  # Optional: Slack/Discord webhook
+    webhook_url: ""
 
 projects:
   - name: "My Project"
     path: /path/to/project
     branch: main
-    deploy_method: docker-compose  # or systemd, custom
-    
+    deploy_method: docker-compose
     docker_compose:
-      service_name: app
+      service_name: web
       build_flags: "--build"
       up_flags: "-d"
-    
-    pre_deploy: []   # Commands to run before deployment
-    post_deploy:     # Commands to run after deployment
+    health:
+      url: http://localhost:8000/health
+      expected_status: 200
+      container_name: web
+    pre_deploy:
+      - echo "Backing up..."
+    post_deploy:
       - docker system prune -f
-    
     enabled: true
 ```
 
-### Deployment Methods
+- `global.history_retention_days` controls how much health/deploy history is kept for the charts.
+- `global.web_port` chooses the port the Flask UI listens on (default 8000).
+- `projects[].health` can declare HTTP probes (`url`, `expected_status`), a `container_name` to label results, or a custom `script` when probing requires logic.
+- `pre_deploy`/`post_deploy` are ordered shell commands executed in the project directory.
+- `projects[].enabled` lets you disable entries without removing them.
 
-#### Docker Compose (recommended for containerized apps)
+Use `config.example.yaml` as your starting point.
+
+## Deployment Methods
+
+### Docker Compose
+
 ```yaml
 deploy_method: docker-compose
 docker_compose:
@@ -80,216 +147,118 @@ docker_compose:
   up_flags: "-d"
 ```
 
-#### Systemd (for system services)
+The engine runs `docker compose down --remove-orphans` followed by `docker compose up <service> <up_flags> <build_flags>`.
+
+### Systemd
+
 ```yaml
 deploy_method: systemd
 systemd:
   service_name: my-service
 ```
 
-#### Custom Script
+Restarts the named systemd service and reports health via `systemctl is-active`.
+
+### Custom
+
 ```yaml
 deploy_method: custom
 custom:
   deploy_script: /path/to/deploy.sh
 ```
 
-### Adding Notifications
+Runs your script with `run_command`; any failure cancels deployment and logs the error.
 
-Configure webhook notifications in `config.yaml`:
+## Notifications
 
-```yaml
-global:
-  notifications:
-    enabled: true
-    webhook_url: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
-```
-
-**Slack webhook example:**
-1. Create incoming webhook in Slack
-2. Copy webhook URL
-3. Add to config.yaml
-
-**Discord webhook example:**
-1. Server Settings → Integrations → Webhooks
-2. Create webhook and copy URL
-3. Add `/slack` to the end of Discord webhook URL
-4. Add to config.yaml
+Enabled notifications POST both `text` and `content` to the webhook URL so that Slack, Discord, and similar services receive the same payload. Notifications are dispatched when deployments succeed/fail, git checks fail, or divergence is detected.
 
 ## Usage
 
 ### Manual Testing
-```bash
-# Run once and exit
-python3 auto-deploy.py --once
 
-# Run with custom config file
-python3 auto-deploy.py /path/to/config.yaml --once
+```bash
+python3 auto-deploy.py --once
+python3 auto-deploy.py config.yaml --once --mode=engine
 ```
 
 ### Service Management
+
 ```bash
-# Start service
 sudo systemctl start auto-deploy
-
-# Stop service
+sudo systemctl restart auto-deploy
 sudo systemctl stop auto-deploy
-
-# Restart service
-sudo systemctl restart auto-deploy
-
-# Check status
 sudo systemctl status auto-deploy
-
-# View logs (live)
 sudo journalctl -u auto-deploy -f
-
-# View log files
-tail -f /var/log/auto-deploy/*.log
+sudo tail -f /var/log/auto-deploy/*.log
 ```
 
-### Configuration Changes
-
-After editing `config.yaml`:
-```bash
-# Restart service to apply changes
-sudo systemctl restart auto-deploy
-```
+`auto-deploy.service` runs `.venv/bin/python` from the repo root. Adjust the unit file if your virtualenv lives elsewhere or you want to use a different user.
 
 ## How It Works
 
-1. **Check Cycle**: Every X seconds (configured in `check_interval`)
-2. **For Each Project**:
-   - Fetch latest changes from remote repository
-   - Compare local and remote commits
-   - If local is behind:
-     - Stash uncommitted changes (if any)
-     - Pull latest changes
-     - Run pre-deployment commands
-     - Deploy using configured method
-     - Run post-deployment commands
-     - Send notification (if enabled)
-   - If up-to-date: Skip deployment
-   - If diverged: Log warning and send notification
+1. Every `check_interval` seconds, the engine fetches each project, compares local, remote, and merge-base commits, and if the local branch is behind it begins an update.
+2. It stashes local changes (if any), pulls, and runs `pre_deploy` hooks before the configured deployment method.
+3. Post-deploy hooks run afterward, `deploy_history` is recorded, and notifications fire on success/failure.
+4. A background thread updates health statuses per project and feeds the monitoring UI with `history` buckets that power the charts.
 
 ## Logs
 
-Logs are stored in two places:
-
-1. **Systemd journal**: `journalctl -u auto-deploy -f`
-2. **Log files**: `/var/log/auto-deploy/auto-deploy-YYYYMMDD.log`
-
-Log format:
-```
-[2025-10-30 12:00:00] INFO - Starting update check cycle...
-[2025-10-30 12:00:01] INFO - Checking Formation Skydiving Builder...
-[2025-10-30 12:00:02] INFO - Formation Skydiving Builder is behind remote
-[2025-10-30 12:00:05] INFO - Successfully pulled changes
-[2025-10-30 12:00:10] INFO - ✅ Formation Skydiving Builder successfully updated
-```
+- The primary log file is at `global.log_directory` (default `/var/log/auto-deploy/auto-deploy.log`).
+- The service also writes to the systemd journal (`journalctl -u auto-deploy`).
+- The `logs/` directory is available for local testing outside systemd.
 
 ## Troubleshooting
 
-### Service won't start
 ```bash
-# Check service status and errors
-sudo systemctl status auto-deploy
-sudo journalctl -u auto-deploy -n 50
-
-# Check Python and dependencies
-python3 --version
-pip3 list | grep -E "PyYAML|requests"
+cd /root/auto-deploy-service
+python3 auto-deploy.py --once
+sudo journalctl -u auto-deploy -n 100
+sudo tail -n 200 /var/log/auto-deploy/*.log
 ```
 
-### Updates not detected
-```bash
-# Test git access manually
-cd /root/formation_skydiving_builder
-git fetch origin main
-git status
-
-# Check if branch is properly tracking remote
-git branch -vv
-```
-
-### Deployment fails
-```bash
-# Check Docker status
-sudo systemctl status docker
-docker ps -a
-
-# Verify docker-compose.yml
-cd /root/formation_skydiving_builder
-docker compose config
-
-# Test deployment manually
-docker compose down
-docker compose up app -d --build
-```
-
-### Permission issues
-```bash
-# Ensure service runs as root (required for Docker)
-sudo systemctl edit auto-deploy
-
-# Add or verify:
-[Service]
-User=root
-```
+- Use `git fetch origin <branch>` / `git merge-base` manually to check Git access.
+- `docker compose config` verifies compose files before deployment.
+- `health.script` gives you a way to run tests or curl commands inside the project before health is reported healthy.
 
 ## Security Considerations
 
-1. **Git Authentication**: 
-   - Use SSH keys for private repositories
-   - Configure git credentials to avoid password prompts
-   ```bash
-   git config --global credential.helper store
-   ```
-
-2. **File Permissions**:
-   ```bash
-   chmod 600 /root/auto-deploy-service/config.yaml
-   chmod 700 /root/auto-deploy-service/auto-deploy.py
-   ```
-
-3. **Webhook Security**:
-   - Keep webhook URLs secret
-   - Use environment variables for sensitive data
-   - Consider using encrypted configuration
+1. Use SSH keys or credentials helpers for Git and keep webhook URLs out of committed code (`chmod 600 config.yaml`).
+2. The UI is unauthenticated. Restrict access via firewall rules or a proxy.
+3. Protect the `.venv` and `config.yaml` files so only the deploy user (often root) can read them.
 
 ## Advanced Configuration
 
-### Different Check Intervals per Project
+### Multiple check intervals
 
-Currently all projects use the global `check_interval`. To have different intervals, run multiple instances with different configs:
+Run separate instances with different configs if you need finer control:
 
 ```bash
-# Instance 1: Fast updates (1 minute)
 python3 auto-deploy.py config-fast.yaml
-
-# Instance 2: Slow updates (1 hour)
-python3 auto-deploy.py config-slow.yaml
+python3 auto-deploy.py config-slow.yaml --mode=engine
 ```
 
-### Conditional Deployment
-
-Add logic to pre_deploy commands:
+### Conditional deployments
 
 ```yaml
 pre_deploy:
-  - "if [ -f .deploy-skip ]; then exit 1; fi"  # Skip if .deploy-skip exists
-  - "npm test"  # Only deploy if tests pass
+  - "if [ -f .deploy-skip ]; then exit 1; fi"
+  - "npm test"
 ```
 
-### Health Checks
-
-Add post-deployment health checks:
+### Health scripts
 
 ```yaml
-post_deploy:
-  - "sleep 10"  # Wait for service to start
-  - "curl -f http://localhost:3000/ || systemctl restart my-service"
+health:
+  url: https://localhost/health
+  expected_status: 200
+  container_name: my-app
+  script: /path/to/custom-health.sh
 ```
+
+### History retention
+
+`global.history_retention_days` controls how much data feeds `/api/downtime` and `/api/deployments`. Increase it if you want longer charts and are willing to keep a few more history points in memory.
 
 ## Comparison with Existing Tools
 
@@ -297,27 +266,21 @@ post_deploy:
 |---------|-------------------|------------|-----------|----------------|
 | Git-based deployment | ✅ | ❌ | ❌ | ✅ |
 | Image-based deployment | ❌ | ✅ | ✅ | ✅ |
-| Multi-project | ✅ | ✅ | ✅ | Per repo |
+| Multi-project monitoring | ✅ | ✅ | ✅ | Per repo |
+| Built-in monitoring UI | ✅ | ❌ | ❌ | ❌ |
 | Self-hosted | ✅ | ✅ | ✅ | ❌ |
 | Lightweight | ✅ | ✅ | ❌ | N/A |
-| Configuration file | ✅ | ❌ | Via UI | Via YAML |
-| Custom deployment | ✅ | ❌ | Limited | ✅ |
+| YAML config | ✅ | ❌ | UI-only | YAML |
+| Custom deployment hooks | ✅ | ❌ | Limited | ✅ |
 
 ## Uninstallation
 
 ```bash
-# Stop and disable service
 sudo systemctl stop auto-deploy
 sudo systemctl disable auto-deploy
-
-# Remove service file
 sudo rm /etc/systemd/system/auto-deploy.service
 sudo systemctl daemon-reload
-
-# Remove service directory (optional)
 rm -rf /root/auto-deploy-service
-
-# Remove logs (optional)
 rm -rf /var/log/auto-deploy
 ```
 

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Auto-Deploy Monitoring</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .healthy { color: green; }
+    .unhealthy { color: red; }
+    .unknown { color: gray; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; }
+    th { background: #f4f4f4; }
+  </style>
+</head>
+<body>
+  <h1>Auto-Deploy Monitoring</h1>
+  <p>Polling every 30 seconds.</p>
+  <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;">
+    <button id="refresh-btn">Refresh</button>
+    <label for="range-select">Range:</label>
+    <select id="range-select">
+      <option value="7d">Last 7 days (per hour)</option>
+      <option value="3d">Last 3 days (per hour)</option>
+      <option value="24h">Last 24 hours (per 5 minutes)</option>
+      <option value="1h">Last hour (per minute)</option>
+    </select>
+  </div>
+  <table id="status-table">
+    <thead>
+      <tr>
+        <th>Project</th>
+        <th>Health</th>
+        <th>Last Checked</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <h2>Aggregated Downtime</h2>
+  <canvas id="downtime-chart" width="800" height="300"></canvas>
+  <h2>Deployments</h2>
+  <canvas id="deployments-chart" width="800" height="200"></canvas>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="/static/monitor.js"></script>
+</body>
+</html>

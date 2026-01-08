@@ -11,16 +11,73 @@ import yaml
 import subprocess
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import time
 import requests
+try:
+    import docker
+except Exception:
+    docker = None
+from threading import Thread, Lock
+from flask import Flask, jsonify, render_template
+from logging.handlers import TimedRotatingFileHandler
 
 class AutoDeployService:
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, mode: str = 'all'):
         self.config_path = config_path
         self.config = self.load_config()
         self.setup_logging()
+        # Mode controls which components run: 'engine', 'monitor', or 'all'
+        self.mode = mode
+        # Health/status store and synchronization
+        self.status_lock = Lock()
+        self.statuses: Dict[str, Dict] = {}
+        # Recent health history per project: list of (timestamp_seconds, is_unhealthy)
+        self.history: Dict[str, List[tuple]] = {}
+        # Deployment history per project: list of timestamp_seconds
+        self.deploy_history: Dict[str, List[int]] = {}
+        # retention for history in seconds (default 7 days)
+        self.history_retention_seconds = int(self.config.get('global', {}).get('history_retention_days', 7)) * 24 * 3600
+        # retention for deploy history (same default)
+        self.deploy_history_retention_seconds = self.history_retention_seconds
+        # Web server port (optional override in config.global.web_port)
+        self.web_port = int(self.config.get('global', {}).get('web_port', 8000))
+        # Docker client (optional): prefer SDK, fall back to shell commands
+        self.docker_client = None
+        if docker is not None:
+            try:
+                self.docker_client = docker.from_env()
+            except Exception as e:
+                # Log full exception and continue using shell fallback
+                try:
+                    self.logger.exception('Docker SDK not available or cannot connect to Docker; falling back to shell')
+                except Exception:
+                    # If logger isn't yet fully configured, fallback to basic logging
+                    logging.getLogger(__name__).exception('Docker SDK init failed')
+                self.docker_client = None
+
+    def send_notification(self, message: str) -> None:
+        notifications = self.config.get('global', {}).get('notifications', {}) or {}
+        if not notifications.get('enabled', False):
+            return
+
+        webhook_url = (notifications.get('webhook_url') or '').strip()
+        if not webhook_url:
+            self.logger.warning('Notifications enabled but webhook_url is empty')
+            return
+
+        try:
+            # Support common webhook payload shapes (Slack uses `text`, Discord uses `content`).
+            resp = requests.post(
+                webhook_url,
+                json={'text': message, 'content': message},
+                timeout=10,
+            )
+            if resp.status_code >= 400:
+                self.logger.error(f'Notification failed: HTTP {resp.status_code} {resp.text[:500]}')
+        except Exception as e:
+            self.logger.error(f'Notification failed: {e}')
         
     def load_config(self) -> Dict:
         """Load configuration from YAML file."""
@@ -31,29 +88,165 @@ class AutoDeployService:
         """Configure logging with both file and console output."""
         log_dir = Path(self.config['global']['log_directory'])
         log_dir.mkdir(parents=True, exist_ok=True)
-        
-        log_file = log_dir / f"auto-deploy-{datetime.now().strftime('%Y%m%d')}.log"
-        
-        # Configure logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[%(asctime)s] %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        self.logger.info("="*60)
-        self.logger.info("Auto-Deploy Service started")
-        self.logger.info("="*60)
-    
+
+        # Retention in days for rotated files
+        retention_days = int(self.config.get('global', {}).get('log_retention_days', 7))
+        log_file = log_dir / 'auto-deploy.log'
+
+        try:
+            handler = TimedRotatingFileHandler(filename=str(log_file), when='midnight', interval=1, backupCount=retention_days)
+            formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+
+            root_logger = logging.getLogger()
+            root_logger.setLevel(logging.INFO)
+            # Avoid adding duplicate file handler
+            if not any(isinstance(h, TimedRotatingFileHandler) and getattr(h, 'baseFilename', '') == str(log_file) for h in root_logger.handlers):
+                root_logger.addHandler(handler)
+            # Ensure console output exists
+            if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+                root_logger.addHandler(logging.StreamHandler(sys.stdout))
+
+            self.logger = logging.getLogger(__name__)
+            self.logger.info("="*60)
+            self.logger.info("Auto-Deploy Service started")
+            self.logger.info("="*60)
+        except Exception:
+            logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
+            self.logger = logging.getLogger(__name__)
+            self.logger.warning("Failed to initialize TimedRotatingFileHandler, using basic logging")
+
+    def create_flask_app(self) -> Flask:
+        """Create Flask app and register routes for monitoring."""
+        template_dir = Path(__file__).parent / 'monitoring' / 'templates'
+        static_dir = Path(__file__).parent / 'monitoring' / 'static'
+        app = Flask(__name__, template_folder=str(template_dir), static_folder=str(static_dir))
+
+        @app.route('/api/health')
+        def api_health():
+            with self.status_lock:
+                return jsonify(self.statuses)
+
+        @app.route('/api/downtime')
+        def api_downtime():
+            # Query param 'range' accepts: '7d','3d','24h','1h'
+            from flask import request
+            range_key = request.args.get('range', '7d')
+            now = int(time.time())
+
+            if range_key == '7d':
+                total_seconds = 7 * 24 * 3600
+                bucket_size = 3600
+            elif range_key == '3d':
+                total_seconds = 3 * 24 * 3600
+                bucket_size = 3600
+            elif range_key == '24h':
+                total_seconds = 24 * 3600
+                bucket_size = 300
+            elif range_key == '1h':
+                total_seconds = 3600
+                bucket_size = 60
+            else:
+                # default
+                total_seconds = 7 * 24 * 3600
+                bucket_size = 3600
+
+            num_buckets = int(total_seconds // bucket_size)
+            # build bucket boundaries: bucket i covers [start + i*bucket_size, start + (i+1)*bucket_size)
+            start_ts = now - total_seconds
+            labels = []
+            for i in range(num_buckets):
+                ts = start_ts + i * bucket_size
+                labels.append(datetime.fromtimestamp(ts, timezone.utc).isoformat().replace('+00:00', 'Z'))
+
+            projects = {}
+            with self.status_lock:
+                for pname in self.statuses.keys():
+                    # initialize counts per bucket
+                    counts = [0] * num_buckets
+                    unhealthy = [0] * num_buckets
+                    entries = self.history.get(pname, [])
+                    for ts, is_unhealthy in entries:
+                        if ts < start_ts:
+                            continue
+                        if ts >= now:
+                            continue
+                        idx = int((ts - start_ts) // bucket_size)
+                        if idx < 0 or idx >= num_buckets:
+                            continue
+                        counts[idx] += 1
+                        if is_unhealthy:
+                            unhealthy[idx] += 1
+
+                    # compute percentages
+                    pct = []
+                    for c, u in zip(counts, unhealthy):
+                        if c == 0:
+                            pct.append(0)
+                        else:
+                            pct.append(round((u / c) * 100, 2))
+
+                    projects[pname] = pct
+
+            return jsonify({'labels': labels, 'projects': projects})
+
+        @app.route('/api/deployments')
+        def api_deployments():
+            from flask import request
+            range_key = request.args.get('range', '7d')
+            now = int(time.time())
+
+            if range_key == '7d':
+                total_seconds = 7 * 24 * 3600
+                bucket_size = 3600
+            elif range_key == '3d':
+                total_seconds = 3 * 24 * 3600
+                bucket_size = 3600
+            elif range_key == '24h':
+                total_seconds = 24 * 3600
+                bucket_size = 300
+            elif range_key == '1h':
+                total_seconds = 3600
+                bucket_size = 60
+            else:
+                total_seconds = 7 * 24 * 3600
+                bucket_size = 3600
+
+            num_buckets = int(total_seconds // bucket_size)
+            start_ts = now - total_seconds
+            labels = [datetime.fromtimestamp(start_ts + i * bucket_size, timezone.utc).isoformat().replace('+00:00', 'Z') for i in range(num_buckets)]
+
+            projects = {}
+            with self.status_lock:
+                for pname in self.statuses.keys():
+                    counts = [0] * num_buckets
+                    dlist = self.deploy_history.get(pname, [])
+                    for ts in dlist:
+                        if ts < start_ts or ts >= now:
+                            continue
+                        idx = int((ts - start_ts) // bucket_size)
+                        if 0 <= idx < num_buckets:
+                            counts[idx] += 1
+                    projects[pname] = counts
+
+            return jsonify({'labels': labels, 'projects': projects})
+
+        @app.route('/')
+        def index():
+            return render_template('index.html')
+
+        return app
+
     def run_command(self, cmd: str, cwd: str = None) -> tuple[bool, str]:
         """Execute a shell command and return success status and output."""
         try:
+            # Convert string command to list for safer execution without shell=True
+            # For complex commands, we still need shell interpretation, so use shlex
+            import shlex
+            cmd_list = shlex.split(cmd) if isinstance(cmd, str) else cmd
             result = subprocess.run(
-                cmd,
-                shell=True,
+                cmd_list,
+                shell=False,
                 cwd=cwd,
                 capture_output=True,
                 text=True,
@@ -64,21 +257,225 @@ class AutoDeployService:
             return False, "Command timed out after 5 minutes"
         except Exception as e:
             return False, str(e)
-    
-    def send_notification(self, message: str):
-        """Send notification via webhook if enabled."""
-        if not self.config['global']['notifications']['enabled']:
-            return
-        
-        webhook_url = self.config['global']['notifications']['webhook_url']
-        if not webhook_url:
-            return
-        
+
+    def start_web(self, host: str = '0.0.0.0', port: int = 8000):
+        """Start the Flask web server in a background thread."""
         try:
-            payload = {"text": message}
-            requests.post(webhook_url, json=payload, timeout=10)
+            self.app = self.create_flask_app()
+            thread = Thread(target=lambda: self.app.run(host=host, port=port, use_reloader=False), daemon=True)
+            thread.start()
+            self.logger.info(f"Monitoring web server started on {host}:{port}")
         except Exception as e:
-            self.logger.warning(f"Failed to send notification: {e}")
+            self.logger.error(f"Failed to start web server: {e}")
+
+    def start_health_scheduler(self):
+        """Start a background thread that periodically updates health statuses."""
+        def scheduler():
+            interval = int(self.config['global'].get('check_interval', 300))
+            while True:
+                try:
+                    projects = self.config.get('projects', [])
+                    for project in projects:
+                        if not project.get('enabled', True):
+                            continue
+                        status = self.check_project_health(project)
+                        with self.status_lock:
+                            self.statuses[project['name']] = status
+                            # append history entry: timestamp seconds, is_unhealthy flag
+                            ts = int(datetime.utcnow().timestamp())
+                            is_unhealthy = (status.get('status') != 'healthy')
+                            hlist = self.history.setdefault(project['name'], [])
+                            hlist.append((ts, 1 if is_unhealthy else 0))
+                            # prune old entries beyond retention
+                            cutoff = ts - self.history_retention_seconds
+                            # keep entries with timestamp >= cutoff
+                            while hlist and hlist[0][0] < cutoff:
+                                hlist.pop(0)
+                    time.sleep(interval)
+                except Exception as e:
+                    self.logger.error(f"Health scheduler error: {e}", exc_info=True)
+                    time.sleep(interval)
+
+        thread = Thread(target=scheduler, daemon=True)
+        thread.start()
+        self.logger.info("Health scheduler started")
+
+    def check_project_health(self, project: Dict) -> Dict:
+        """Perform health check for a single project and return status dict.
+
+        Returns: {status: 'healthy'|'unhealthy'|'unknown', last_checked: ISO8601, details: str}
+        """
+        now = datetime.utcnow().isoformat() + 'Z'
+        try:
+            # If explicit HTTP health check configured
+            health_cfg = project.get('health', {})
+            explicit_container = health_cfg.get('container_name') if health_cfg else None
+            if health_cfg and 'url' in health_cfg:
+                url = health_cfg['url']
+                expected = int(health_cfg.get('expected_status', 200))
+                try:
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code == expected:
+                        return {'status': 'healthy', 'last_checked': now, 'details': f'HTTP {resp.status_code}', 'container_name': explicit_container}
+                    else:
+                        return {'status': 'unhealthy', 'last_checked': now, 'details': f'HTTP {resp.status_code}', 'container_name': explicit_container}
+                except Exception as e:
+                    return {'status': 'unhealthy', 'last_checked': now, 'details': str(e), 'container_name': explicit_container}
+
+            method = project.get('deploy_method')
+            if method == 'docker-compose':
+                service = project.get('docker_compose', {}).get('service_name')
+                if not service:
+                    return {'status': 'unknown', 'last_checked': now, 'details': 'No docker service_name configured'}
+                # Check docker containers by name with multiple matching strategies:
+                # candidates: exact service, project dir basename, compose-style names (underscore/hyphen variants)
+                project_basename = Path(project.get('path', '')).name
+                candidates = set()
+                candidates.add(service)
+                if project_basename:
+                    candidates.add(project_basename)
+                    candidates.add(f"{project_basename}_{service}_1")
+                    candidates.add(f"{project_basename}-{service}-1")
+                candidates.add(f"{service}_1")
+                candidates.add(f"{service}-1")
+
+                # Use Docker SDK if available for more reliable queries
+                def _parse_started_at(started_at: str) -> Optional[str]:
+                    # Docker times are RFC3339 like: 2026-01-08T10:00:00.123456Z
+                    if not started_at:
+                        return ''
+                    s = started_at
+                    if s.endswith('Z'):
+                        s = s[:-1]
+                    fmt = None
+                    try:
+                        # try microseconds
+                        dt = datetime.strptime(s, '%Y-%m-%dT%H:%M:%S.%f')
+                    except Exception:
+                        try:
+                            dt = datetime.strptime(s, '%Y-%m-%dT%H:%M:%S')
+                        except Exception:
+                            return ''
+                    delta = datetime.utcnow() - dt
+                    days = delta.days
+                    secs = delta.seconds
+                    hours = secs // 3600
+                    mins = (secs % 3600) // 60
+                    if days > 0:
+                        return f'Up {days}d {hours}h'
+                    if hours > 0:
+                        return f'Up {hours}h {mins}m'
+                    if mins > 0:
+                        return f'Up {mins}m'
+                    return 'Up a few seconds'
+
+                containers = None
+                if self.docker_client:
+                    try:
+                        containers = self.docker_client.containers.list(all=True)
+                    except Exception as e:
+                        # Don't fail hard; log and fall back to shell-based check
+                        try:
+                            self.logger.exception('Docker SDK error while listing containers; falling back to shell')
+                        except Exception:
+                            logging.getLogger(__name__).exception('Docker SDK list failed')
+                        containers = None
+
+                if containers is not None:
+                    found = None
+                    for c in containers:
+                        names = c.name
+                        image = ''
+                        try:
+                            image = ','.join(c.image.tags) if getattr(c.image, 'tags', None) else str(c.image)
+                        except Exception:
+                            image = str(getattr(c, 'image', ''))
+
+                        match = False
+                        for cand in candidates:
+                            if not cand:
+                                continue
+                            if names == cand or cand in names or cand in image:
+                                match = True
+                                break
+
+                        if match:
+                            found = c
+                            break
+
+                    if found:
+                        names = found.name
+                        state = found.attrs.get('State', {})
+                        started_at = state.get('StartedAt', '')
+                        health_info = state.get('Health', {})
+                        health_status = health_info.get('Status') if health_info else None
+                        uptime = _parse_started_at(started_at) or state.get('Status', '')
+                        # Consider healthy if container is running and health (if present) is 'healthy'
+                        running = state.get('Status') == 'running' or found.status == 'running'
+                        is_healthy = running and (health_status in (None, 'healthy'))
+                        status_str = 'healthy' if is_healthy else 'unhealthy'
+                        details = f"{uptime} ({health_status or state.get('Status')})|{names}"
+                        container_name = explicit_container or names
+                        return {'status': status_str, 'last_checked': now, 'details': details, 'container_name': container_name}
+
+                    # no matching container found via SDK
+                    # fall through to shell-based check
+
+                # Fallback to shell-based check if SDK unavailable or didn't find a match
+                success, output = self.run_command("docker ps --format '{{.Status}}|{{.Names}}|{{.Image}}'")
+                if not success:
+                    return {'status': 'unhealthy', 'last_checked': now, 'details': output.strip(), 'container_name': explicit_container}
+
+                found = None
+                for line in output.splitlines():
+                    parts = line.split('|', 2)
+                    if len(parts) != 3:
+                        continue
+                    status_text, names, image = parts[0].strip(), parts[1].strip(), parts[2].strip()
+
+                    match = False
+                    for cand in candidates:
+                        if not cand:
+                            continue
+                        if names == cand or cand in names or cand in image:
+                            match = True
+                            break
+
+                    if match:
+                        found = (status_text, names)
+                        break
+
+                if found:
+                    status_text, names = found
+                    container_name = explicit_container or names
+                    if 'Up' in status_text:
+                        return {'status': 'healthy', 'last_checked': now, 'details': f"{status_text}|{names}", 'container_name': container_name}
+                    else:
+                        return {'status': 'unhealthy', 'last_checked': now, 'details': f"{status_text}|{names}", 'container_name': container_name}
+
+                return {'status': 'unhealthy', 'last_checked': now, 'details': 'No matching container', 'container_name': explicit_container}
+
+            elif method == 'systemd':
+                service_name = project.get('systemd', {}).get('service_name')
+                if not service_name:
+                    return {'status': 'unknown', 'last_checked': now, 'details': 'No systemd.service_name configured'}
+                success, output = self.run_command(f"systemctl is-active {service_name}")
+                if success and output.strip() == 'active':
+                    return {'status': 'healthy', 'last_checked': now, 'details': 'active', 'container_name': explicit_container}
+                else:
+                    return {'status': 'unhealthy', 'last_checked': now, 'details': output.strip(), 'container_name': explicit_container}
+
+            elif method == 'custom':
+                # Allow custom health script via project.health.script
+                script = project.get('health', {}).get('script')
+                if script:
+                    success, output = self.run_command(script, cwd=project.get('path'))
+                    return {'status': 'healthy' if success else 'unhealthy', 'last_checked': now, 'details': output.strip(), 'container_name': explicit_container}
+                return {'status': 'unknown', 'last_checked': now, 'details': 'No custom health check configured', 'container_name': explicit_container}
+
+            return {'status': 'unknown', 'last_checked': now, 'details': 'No health check available', 'container_name': explicit_container}
+        except Exception as e:
+            return {'status': 'unhealthy', 'last_checked': now, 'details': str(e), 'container_name': explicit_container}
     
     def check_git_status(self, project: Dict) -> Optional[Dict]:
         """
@@ -92,23 +489,23 @@ class AutoDeployService:
         success, output = self.run_command(f"git fetch origin {branch}", cwd=path)
         if not success:
             self.logger.error(f"Failed to fetch from remote: {output}")
-            return None
+            return {'error': output.strip() or 'Failed to fetch from remote'}
         
         # Get commit hashes
         success, local = self.run_command("git rev-parse @", cwd=path)
         if not success:
             self.logger.error(f"Failed to get local commit: {local}")
-            return None
+            return {'error': local.strip() or 'Failed to get local commit'}
         
         success, remote = self.run_command("git rev-parse @{u}", cwd=path)
         if not success:
             self.logger.error(f"Failed to get remote commit: {remote}")
-            return None
+            return {'error': remote.strip() or 'Failed to get remote commit'}
         
         success, base = self.run_command("git merge-base @ @{u}", cwd=path)
         if not success:
             self.logger.error(f"Failed to get merge base: {base}")
-            return None
+            return {'error': base.strip() or 'Failed to get merge base'}
         
         local = local.strip()
         remote = remote.strip()
@@ -226,11 +623,13 @@ class AutoDeployService:
                 return False
         return True
     
-    def deploy_project(self, project: Dict, update_info: Dict) -> bool:
+    def deploy_project(self, project: Dict, update_info: Optional[Dict] = None) -> bool:
         """Deploy a project using configured method."""
+        commit_message = (update_info or {}).get('commit_message', 'N/A')
+        commit_author = (update_info or {}).get('commit_author', 'Auto-Deploy Service')
         self.logger.info(f"Deploying {project['name']}...")
-        self.logger.info(f"  Latest commit: {update_info['commit_message']}")
-        self.logger.info(f"  Author: {update_info['commit_author']}")
+        self.logger.info(f"  Latest commit: {commit_message}")
+        self.logger.info(f"  Author: {commit_author}")
         
         # Run pre-deployment commands
         if not self.run_commands(project.get('pre_deploy', []), project['path'], "pre-deployment"):
@@ -256,7 +655,19 @@ class AutoDeployService:
         # Run post-deployment commands
         if not self.run_commands(project.get('post_deploy', []), project['path'], "post-deployment"):
             self.logger.warning("Post-deployment commands failed, but deployment was successful")
-        
+
+        # Record successful deployment
+        try:
+            ts = int(time.time())
+            with self.status_lock:
+                dlist = self.deploy_history.setdefault(project['name'], [])
+                dlist.append(ts)
+                cutoff = ts - self.deploy_history_retention_seconds
+                while dlist and dlist[0] < cutoff:
+                    dlist.pop(0)
+        except Exception:
+            self.logger.exception('Failed to record deploy history')
+
         return True
     
     def process_project(self, project: Dict):
@@ -270,6 +681,7 @@ class AutoDeployService:
         self.logger.info(f"Checking {name}...")
         
         # Verify project path exists
+        self.logger.info(f"Checking path: {project['path']}")
         if not os.path.exists(project['path']):
             self.logger.error(f"Project path does not exist: {project['path']}")
             return
@@ -279,10 +691,35 @@ class AutoDeployService:
         
         if update_info is None:
             self.logger.info(f"{name} is up to date")
+            if project.get('deploy_method') == 'docker-compose':
+                health = self.check_project_health(project)
+                health_status = health.get('status', 'unknown')
+                if health_status != 'healthy':
+                    details = health.get('details', 'no details')
+                    self.logger.warning(f"{name} up to date but container status is {health_status}: {details}")
+                    recovery_info = {
+                        'commit_message': f"Health recovery run (status={health_status})",
+                        'commit_author': 'Auto-Deploy Service'
+                    }
+                    if self.deploy_project(project, recovery_info):
+                        notif = f"✅ {name}: Container recovered and redeployed (status={health_status})"
+                        self.logger.info(f"{name} container recovered after health check")
+                        self.send_notification(notif)
+                    else:
+                        notif = f"❌ {name}: Recovery redeploy failed after health check (status={health_status})"
+                        self.logger.error(f"{name} recovery deployment failed")
+                        self.send_notification(notif)
+            return
+
+        if isinstance(update_info, dict) and update_info.get('error'):
+            self.logger.error(f"{name}: Git check failed: {update_info['error']}")
+            self.send_notification(f"❌ {name}: Git check failed: {update_info['error']}")
             return
         
         # Project is behind - update and deploy
         self.logger.info(f"{name} is behind remote (local: {update_info['local']}, remote: {update_info['remote']})")
+        # Log explicit detection for update auditing
+        self.logger.info(f"Update detected for {name}: remote={update_info['remote']} local={update_info['local']}")
         
         # Pull changes
         if not self.pull_changes(project):
@@ -290,8 +727,10 @@ class AutoDeployService:
             return
         
         # Deploy
+        commit_message = update_info.get('commit_message', 'N/A')
+        commit_author = update_info.get('commit_author', 'Auto-Deploy Service')
         if self.deploy_project(project, update_info):
-            message = f"✅ {name}: Successfully updated and deployed\n📝 {update_info['commit_message']}\n👤 {update_info['commit_author']}"
+            message = f"✅ {name}: Successfully updated and deployed\n📝 {commit_message}\n👤 {commit_author}"
             self.logger.info(f"✅ {name} successfully updated and deployed")
             self.send_notification(message)
         else:
@@ -321,8 +760,16 @@ class AutoDeployService:
     def run(self):
         """Run the service in continuous mode."""
         interval = self.config['global']['check_interval']
+        # Start monitoring web server and health scheduler only if in monitor/all mode
+        if self.mode in ('all', 'monitor'):
+            try:
+                self.start_web(port=self.web_port)
+                self.start_health_scheduler()
+            except Exception:
+                self.logger.exception("Failed to start web/health components")
+
         self.logger.info(f"Running in continuous mode (check interval: {interval}s)")
-        
+
         while True:
             try:
                 self.run_once()
@@ -341,12 +788,24 @@ def main():
     # Check for run mode
     run_once = '--once' in sys.argv
     
-    # Get config file path (filter out --once flag)
+    # Parse args: --once and optional config path and --mode
     args = [arg for arg in sys.argv[1:] if arg != '--once']
-    
-    if len(args) > 0:
-        config_path = args[0]
-    else:
+
+    # Default values
+    mode = 'all'
+    config_path = None
+
+    for arg in args:
+        if arg.startswith('--mode='):
+            mode = arg.split('=', 1)[1]
+        elif arg.startswith('--mode'):
+            # support --mode monitor (next arg)
+            # Not handling this short form for simplicity
+            pass
+        elif not config_path:
+            config_path = arg
+
+    if not config_path:
         # Default to config.yaml in same directory as script
         script_dir = Path(__file__).parent
         config_path = script_dir / 'config.yaml'
@@ -357,8 +816,8 @@ def main():
         sys.exit(1)
     
     # Create and run service
-    service = AutoDeployService(config_path)
-    
+    service = AutoDeployService(config_path, mode=mode)
+
     if run_once:
         service.run_once()
     else:
