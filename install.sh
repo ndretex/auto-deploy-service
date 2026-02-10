@@ -9,6 +9,7 @@ echo "=========================================="
 
 SERVICE_DIR="/root/prod/auto-deploy-service"
 SERVICE_NAME="auto-deploy"
+FIREWALL_SERVICE_NAME="auto-deploy-firewall"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then 
@@ -24,21 +25,28 @@ apt install -y python3-yaml python3-requests
 echo ""
 echo "Step 2: Making script executable..."
 chmod +x "$SERVICE_DIR/auto-deploy.py"
+chmod +x "$SERVICE_DIR/scripts/enforce-dashboard-firewall.sh"
 
 echo ""
 echo "Step 3: Creating log directory..."
 mkdir -p /var/log/auto-deploy
 
 echo ""
-echo "Step 4: Installing systemd service..."
+echo "Step 4: Installing systemd services..."
 cp "$SERVICE_DIR/auto-deploy.service" "/etc/systemd/system/$SERVICE_NAME.service"
+cp "$SERVICE_DIR/auto-deploy-firewall.service" "/etc/systemd/system/$FIREWALL_SERVICE_NAME.service"
 
 echo ""
 echo "Step 5: Reloading systemd daemon..."
 systemctl daemon-reload
 
 echo ""
-echo "Step 6: Enabling and starting service..."
+echo "Step 6: Enabling and starting firewall guard..."
+systemctl enable "$FIREWALL_SERVICE_NAME.service"
+systemctl start "$FIREWALL_SERVICE_NAME.service"
+
+echo ""
+echo "Step 7: Enabling and starting service..."
 systemctl enable "$SERVICE_NAME.service"
 systemctl start "$SERVICE_NAME.service"
 
@@ -52,6 +60,7 @@ systemctl status "$SERVICE_NAME.service" --no-pager | head -15
 echo ""
 echo "Useful commands:"
 echo "  - View status:       systemctl status $SERVICE_NAME"
+echo "  - Firewall status:   systemctl status $FIREWALL_SERVICE_NAME"
 echo "  - View logs:         journalctl -u $SERVICE_NAME -f"
 echo "  - View log files:    tail -f /var/log/auto-deploy/*.log"
 echo "  - Stop service:      systemctl stop $SERVICE_NAME"

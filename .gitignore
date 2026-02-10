@@ -26,3 +26,4 @@ Thumbs.db
 # Local configuration (may contain sensitive data)
 config.yaml
 config.local.yaml
+.env

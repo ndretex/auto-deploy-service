@@ -8,6 +8,8 @@ global:
   
   # Web UI port for the monitoring page
   # (use a non-conflicting port if 8000 is already in use)
+  # Keep web_host as 127.0.0.1 and publish externally through a TLS reverse proxy.
+  web_host: 127.0.0.1
   web_port: 8000
   
   # Log directory (relative to service directory or absolute path)

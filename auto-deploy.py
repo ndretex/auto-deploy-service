@@ -11,6 +11,7 @@ import sys
 import yaml
 import subprocess
 import logging
+from hmac import compare_digest
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -22,12 +23,14 @@ try:
 except Exception:
     docker = None
 from threading import Thread, Lock
-from flask import Flask, jsonify, render_template
+from flask import Flask, Response, jsonify, render_template, request
 from logging.handlers import TimedRotatingFileHandler
+from werkzeug.security import check_password_hash
 
 class AutoDeployService:
     def __init__(self, config_path: str, mode: str = 'all'):
         self.config_path = config_path
+        self.load_env_file()
         self.config = self.load_config()
         self.setup_logging()
         # Mode controls which components run: 'engine', 'monitor', or 'all'
@@ -43,6 +46,8 @@ class AutoDeployService:
         self.history_retention_seconds = int(self.config.get('global', {}).get('history_retention_days', 7)) * 24 * 3600
         # retention for deploy history (same default)
         self.deploy_history_retention_seconds = self.history_retention_seconds
+        # Web server host/port (defaults bind monitor to localhost only)
+        self.web_host = str(self.config.get('global', {}).get('web_host', '127.0.0.1'))
         # Web server port (optional override in config.global.web_port)
         self.web_port = int(self.config.get('global', {}).get('web_port', 8000))
         # Cached project port labels for monitoring table
@@ -87,6 +92,37 @@ class AutoDeployService:
         """Load configuration from YAML file."""
         with open(self.config_path, 'r') as f:
             return yaml.safe_load(f)
+
+    def load_env_file(self) -> None:
+        """Load .env file from script directory into process env (without overriding existing vars)."""
+        env_path = Path(__file__).parent / '.env'
+        if not env_path.exists():
+            return
+
+        try:
+            with env_path.open('r', encoding='utf-8') as env_file:
+                for raw_line in env_file:
+                    line = raw_line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.startswith('export '):
+                        line = line[len('export '):].strip()
+                    if '=' not in line:
+                        continue
+
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if not key:
+                        continue
+
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                        value = value[1:-1]
+
+                    if key not in os.environ:
+                        os.environ[key] = value
+        except Exception:
+            logging.getLogger(__name__).exception('Failed to load .env file')
     
     def setup_logging(self):
         """Configure logging with both file and console output."""
@@ -210,11 +246,62 @@ class AutoDeployService:
             ports_map[name] = self.resolve_project_ports(project)
         return ports_map
 
+    def get_web_auth_config(self) -> Dict[str, object]:
+        """Return mandatory dashboard auth configuration from environment variables."""
+        username = str(os.getenv('AUTO_DEPLOY_DASHBOARD_USERNAME', 'admin') or 'admin')
+        password_hash = str(os.getenv('AUTO_DEPLOY_DASHBOARD_PASSWORD_HASH', '') or '')
+        password = str(os.getenv('AUTO_DEPLOY_DASHBOARD_PASSWORD', '') or '')
+        realm = str(os.getenv('AUTO_DEPLOY_DASHBOARD_REALM', 'Auto-Deploy Monitor') or 'Auto-Deploy Monitor')
+        is_configured = bool(password_hash or password)
+        return {
+            'username': username,
+            'password_hash': password_hash,
+            'password': password,
+            'realm': realm,
+            'is_configured': is_configured,
+        }
+
     def create_flask_app(self) -> Flask:
         """Create Flask app and register routes for monitoring."""
         template_dir = Path(__file__).parent / 'monitoring' / 'templates'
         static_dir = Path(__file__).parent / 'monitoring' / 'static'
         app = Flask(__name__, template_folder=str(template_dir), static_folder=str(static_dir))
+        auth_config = self.get_web_auth_config()
+
+        if not auth_config['is_configured']:
+            raise RuntimeError(
+                "Dashboard password is missing. Set AUTO_DEPLOY_DASHBOARD_PASSWORD_HASH "
+                "(recommended) or AUTO_DEPLOY_DASHBOARD_PASSWORD in .env."
+            )
+
+        def auth_required_response(message: str) -> Response:
+            return Response(
+                message,
+                401,
+                {'WWW-Authenticate': f'Basic realm="{auth_config["realm"]}"'},
+            )
+
+        @app.before_request
+        def enforce_web_auth():
+            provided = request.authorization
+            if provided is None or (provided.type or '').lower() != 'basic':
+                return auth_required_response('Authentication required')
+
+            username_ok = compare_digest(provided.username or '', str(auth_config['username']))
+            if auth_config['password_hash']:
+                try:
+                    password_ok = check_password_hash(
+                        str(auth_config['password_hash']),
+                        provided.password or '',
+                    )
+                except Exception:
+                    password_ok = False
+            else:
+                password_ok = compare_digest(provided.password or '', str(auth_config['password']))
+
+            if not (username_ok and password_ok):
+                return auth_required_response('Invalid credentials')
+            return None
 
         @app.route('/api/health')
         def api_health():
@@ -224,7 +311,6 @@ class AutoDeployService:
         @app.route('/api/downtime')
         def api_downtime():
             # Query param 'range' accepts: '7d','3d','24h','1h'
-            from flask import request
             range_key = request.args.get('range', '7d')
             now = int(time.time())
 
@@ -286,7 +372,6 @@ class AutoDeployService:
 
         @app.route('/api/deployments')
         def api_deployments():
-            from flask import request
             range_key = request.args.get('range', '7d')
             now = int(time.time())
 
@@ -352,7 +437,7 @@ class AutoDeployService:
         except Exception as e:
             return False, str(e)
 
-    def start_web(self, host: str = '0.0.0.0', port: int = 8000):
+    def start_web(self, host: str = '127.0.0.1', port: int = 8000):
         """Start the Flask web server in a background thread."""
         try:
             self.app = self.create_flask_app()
@@ -859,7 +944,7 @@ class AutoDeployService:
         # Start monitoring web server and health scheduler only if in monitor/all mode
         if self.mode in ('all', 'monitor'):
             try:
-                self.start_web(port=self.web_port)
+                self.start_web(host=self.web_host, port=self.web_port)
                 self.start_health_scheduler()
             except Exception:
                 self.logger.exception("Failed to start web/health components")

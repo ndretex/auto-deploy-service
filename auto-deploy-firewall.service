@@ -1,0 +1,13 @@
+[Unit]
+Description=Auto-Deploy Service - Local-only dashboard firewall guard
+After=network-online.target
+Wants=network-online.target
+Before=auto-deploy.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/prod/auto-deploy-service/scripts/enforce-dashboard-firewall.sh /root/prod/auto-deploy-service/config.yaml
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

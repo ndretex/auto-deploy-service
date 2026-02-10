@@ -1,7 +1,7 @@
 [Unit]
 Description=Auto-Deploy Service - Automated Git Repository Deployment (venv)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target auto-deploy-firewall.service
+Wants=network-online.target auto-deploy-firewall.service
 
 [Service]
 # Run the auto-deploy Python from the repository virtualenv so host paths

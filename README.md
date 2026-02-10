@@ -6,9 +6,13 @@ A centralized Python service that watches one or more Git repositories, pulls up
 
 - `auto-deploy.py` – main engine + monitor runner that loads `config.yaml`, checks Git status, redeploys, and runs the Flask web UI on the configured `global.web_port`.
 - `auto-deploy.service` – systemd unit that expects a Python virtualenv at `.venv` inside the repo (`ExecStart=.venv/bin/python auto-deploy.py config.yaml`).
+- `auto-deploy-firewall.service` – systemd oneshot unit that enforces host firewall rules so the dashboard port only accepts loopback traffic.
+- `scripts/enforce-dashboard-firewall.sh` – idempotent rule sync script used by `auto-deploy-firewall.service`.
 - `install.sh` – convenience installer that installs Python system packages, makes the script executable, creates `/var/log/auto-deploy`, and registers the service.
 - `config.example.yaml` – canonical configuration template.
 - `config.yaml` – user configuration (copy from the example and edit per environment).
+- `.env.example` – environment template for dashboard credentials.
+- `deploy/nginx/auto-deploy-monitor.conf.example` + `deploy/caddy/Caddyfile.example` – TLS reverse proxy examples for secure external access.
 - `requirements.txt` – dependencies (`PyYAML`, `requests`, `Flask`, `docker`).
 - `monitoring/templates/index.html` + `monitoring/static/monitor.js` – served by Flask; drives the status table, refresh control, and Chart.js graphs.
 - `logs/` – optional development directory for run records outside the system log.
@@ -19,6 +23,7 @@ A centralized Python service that watches one or more Git repositories, pulls up
 - ✅ **Smart Git detection**: the engine fetches remotes, compares merge bases, stashes local changes if needed, and redeploys only when the local branch is strictly behind.
 - ✅ **Health monitoring**: optional `projects[].health` block supports HTTP probes (`url` + `expected_status`), container-centric checks, or custom scripts; results land in both the UI table and the downtime/deployment aggregates.
 - ✅ **Flask + Chart.js UI**: the embedded interface polls `/api/health`, `/api/downtime`, and `/api/deployments`, renders a status table, and draws downtime/deployment bar charts without bundlers.
+- ✅ **Dashboard authentication**: monitor endpoints require HTTP Basic auth credentials loaded from `.env`.
 - ✅ **Runtime modes**: run the engine alone (`--mode=engine`) or run the engine + monitor (`--mode=all`, the default).
 - ✅ **Notifications**: webhook payloads include both `text` and `content` (compatible with Slack and Discord) and fire when deployments succeed/fail, Git checks error, or divergence is detected.
 - ✅ **History retention**: downtime and deployment charts are built from retention-configurable history buffers (`global.history_retention_days`).
@@ -40,8 +45,11 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.yaml config.yaml
+cp .env.example .env
 # edit config.yaml to describe your projects, branches, and webhook URLs
 nano config.yaml
+# set dashboard credentials
+nano .env
 ```
 
 ### Try the engine manually
@@ -59,21 +67,7 @@ chmod +x install.sh
 sudo ./install.sh
 ```
 
-`install.sh` installs `python3-yaml` + `python3-requests`, creates `/var/log/auto-deploy`, copies `auto-deploy.service` into `/etc/systemd/system`, reloads systemd, and enables `auto-deploy.service`. The bundled unit points at `.venv/bin/python`, so create that virtualenv and install `requirements.txt` before running the installer or edit the service file to use your preferred interpreter path.
-
-### Docker Compose (optional)
-
-```bash
-cd /root/auto-deploy-service
-docker compose up -d --build
-```
-
-- `auto-deploy-engine`: runs the Git-check/deploy loop.
-- `auto-deploy-monitor`: serves the monitoring UI built from `monitoring/templates` + `monitoring/static`.
-
-```bash
-docker compose down
-```
+`install.sh` installs `python3-yaml` + `python3-requests`, creates `/var/log/auto-deploy`, copies `auto-deploy.service` and `auto-deploy-firewall.service` into `/etc/systemd/system`, reloads systemd, and enables both services. The bundled app unit points at `.venv/bin/python`, so create that virtualenv and install `requirements.txt` before running the installer or edit the service file to use your preferred interpreter path.
 
 ## Runtime modes
 
@@ -92,13 +86,14 @@ The Flask app exposes the following endpoints:
 - `/api/downtime?range=7d|3d|24h|1h` → downtime percentage buckets used by the downtime chart.
 - `/api/deployments?range=...` → deployment counts per bucket.
 
-Chart.js is loaded from `https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js`, the client refreshes every 30 seconds, and a manual refresh button pulls the latest health data. There is no authentication, so expose this UI only on trusted networks or behind a proxy.
+Chart.js is loaded from `https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js`, the client refreshes every 30 seconds, and a manual refresh button pulls the latest health data. Dashboard auth is required and is read from `.env`.
 
 ## Configuration
 
 ```yaml
 global:
   check_interval: 300                  # seconds between check cycles
+  web_host: 127.0.0.1                  # bind to localhost; expose via TLS proxy
   web_port: 8000                       # Flask UI port (change to suit your network)
   log_directory: /var/log/auto-deploy
   log_retention_days: 7
@@ -128,12 +123,43 @@ projects:
 ```
 
 - `global.history_retention_days` controls how much health/deploy history is kept for the charts.
+- `global.web_host` should remain `127.0.0.1` for secure deployments.
 - `global.web_port` chooses the port the Flask UI listens on (default 8000).
 - `projects[].health` can declare HTTP probes (`url`, `expected_status`), a `container_name` to label results, or a custom `script` when probing requires logic.
 - `pre_deploy`/`post_deploy` are ordered shell commands executed in the project directory.
 - `projects[].enabled` lets you disable entries without removing them.
 
 Use `config.example.yaml` as your starting point.
+
+### Dashboard Auth (.env)
+
+```env
+AUTO_DEPLOY_DASHBOARD_USERNAME=admin
+AUTO_DEPLOY_DASHBOARD_PASSWORD_HASH=
+# Optional fallback only if HASH is empty:
+# AUTO_DEPLOY_DASHBOARD_PASSWORD=change-me
+AUTO_DEPLOY_DASHBOARD_REALM=Auto-Deploy Monitor
+```
+
+- Use `AUTO_DEPLOY_DASHBOARD_PASSWORD_HASH` (recommended) or `AUTO_DEPLOY_DASHBOARD_PASSWORD`.
+- Generate a hash with:
+  - `python3 -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('change-me'))"`
+- `.env` is auto-loaded from the repository root and is ignored by Git.
+
+### TLS Reverse Proxy
+
+- Keep the app bound to localhost (`global.web_host: 127.0.0.1`).
+- Use one of the provided secure proxy examples:
+  - Nginx: `deploy/nginx/auto-deploy-monitor.conf.example`
+  - Caddy: `deploy/caddy/Caddyfile.example`
+- Point proxy upstream to `127.0.0.1:<global.web_port>`.
+
+### Firewall Guard
+
+- `auto-deploy-firewall.service` runs `scripts/enforce-dashboard-firewall.sh` and inserts host firewall rules that drop non-loopback traffic to `global.web_port`.
+- The rule is idempotent and is re-applied at boot (`WantedBy=multi-user.target`), so port exposure stays locked down even if host firewall defaults are permissive.
+- Manual run:
+  - `sudo /root/auto-deploy-service/scripts/enforce-dashboard-firewall.sh /root/auto-deploy-service/config.yaml`
 
 ## Deployment Methods
 
@@ -189,6 +215,7 @@ sudo systemctl start auto-deploy
 sudo systemctl restart auto-deploy
 sudo systemctl stop auto-deploy
 sudo systemctl status auto-deploy
+sudo systemctl status auto-deploy-firewall
 sudo journalctl -u auto-deploy -f
 sudo tail -f /var/log/auto-deploy/*.log
 ```
@@ -224,8 +251,10 @@ sudo tail -n 200 /var/log/auto-deploy/*.log
 ## Security Considerations
 
 1. Use SSH keys or credentials helpers for Git and keep webhook URLs out of committed code (`chmod 600 config.yaml`).
-2. The UI is unauthenticated. Restrict access via firewall rules or a proxy.
-3. Protect the `.venv` and `config.yaml` files so only the deploy user (often root) can read them.
+2. Use a strong `AUTO_DEPLOY_DASHBOARD_PASSWORD_HASH` in `.env` (preferred over plaintext password).
+3. Always terminate TLS at a reverse proxy (Nginx/Caddy) before exposing dashboard access.
+4. Keep `auto-deploy-firewall.service` enabled so non-loopback access to `global.web_port` is dropped at host firewall level.
+5. Protect `.env`, `.venv`, and `config.yaml` files so only the deploy user (often root) can read them.
 
 ## Advanced Configuration
 
@@ -278,7 +307,10 @@ health:
 ```bash
 sudo systemctl stop auto-deploy
 sudo systemctl disable auto-deploy
+sudo systemctl stop auto-deploy-firewall
+sudo systemctl disable auto-deploy-firewall
 sudo rm /etc/systemd/system/auto-deploy.service
+sudo rm /etc/systemd/system/auto-deploy-firewall.service
 sudo systemctl daemon-reload
 rm -rf /root/auto-deploy-service
 rm -rf /var/log/auto-deploy

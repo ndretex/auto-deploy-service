@@ -1,0 +1,14 @@
+# Replace monitor.example.com with your domain.
+# Caddy will automatically provision and renew TLS certificates.
+
+monitor.example.com {
+    encode gzip zstd
+    reverse_proxy 127.0.0.1:8080
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+    }
+}

@@ -8,7 +8,12 @@ A centralized auto-deployment service that monitors both projects from a single 
 - `/root/auto-deploy-service/` - Main service directory
   - `auto-deploy.py` - Python script that monitors and deploys
   - `config.yaml` - Configuration file listing all projects
+  - `.env.example` - Environment template for dashboard credentials
+  - `deploy/nginx/auto-deploy-monitor.conf.example` - Nginx TLS reverse proxy example
+  - `deploy/caddy/Caddyfile.example` - Caddy TLS reverse proxy example
   - `auto-deploy.service` - Systemd service file
+  - `auto-deploy-firewall.service` - Systemd firewall guard for dashboard port
+  - `scripts/enforce-dashboard-firewall.sh` - Idempotent firewall rule sync script
   - `install.sh` - Installation script
   - `requirements.txt` - Python dependencies
   - `README.md` - Full documentation
@@ -31,6 +36,7 @@ That's it! The service will now:
 ```bash
 # View service status
 systemctl status auto-deploy
+systemctl status auto-deploy-firewall
 
 # View live logs
 journalctl -u auto-deploy -f
@@ -55,6 +61,31 @@ Edit `/root/auto-deploy-service/config.yaml` to:
 - Enable/disable projects
 - Add new projects
 - Configure notifications (webhooks)
+
+Set dashboard credentials in `/root/auto-deploy-service/.env` (required for monitor UI):
+```bash
+cp /root/auto-deploy-service/.env.example /root/auto-deploy-service/.env
+nano /root/auto-deploy-service/.env
+# Optional hash generation helper:
+python3 -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('change-me'))"
+```
+
+Keep monitor binding local-only in `config.yaml`:
+```yaml
+global:
+  web_host: 127.0.0.1
+  web_port: 8080
+```
+
+Make sure firewall guard is active (blocks non-loopback access to dashboard port):
+```bash
+systemctl enable --now auto-deploy-firewall
+systemctl status auto-deploy-firewall
+```
+
+Expose it securely through TLS proxy:
+- Nginx example: `/root/auto-deploy-service/deploy/nginx/auto-deploy-monitor.conf.example`
+- Caddy example: `/root/auto-deploy-service/deploy/caddy/Caddyfile.example`
 
 After editing config, restart the service:
 ```bash
