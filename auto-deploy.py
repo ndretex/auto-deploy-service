@@ -308,28 +308,27 @@ class AutoDeployService:
             with self.status_lock:
                 return jsonify(self.statuses)
 
+        range_windows = {
+            '5m': (5 * 60, 30),
+            '15m': (15 * 60, 60),
+            '30m': (30 * 60, 120),
+            '3h': (3 * 3600, 300),
+            '12h': (12 * 3600, 900),
+            '15d': (15 * 24 * 3600, 6 * 3600),
+            '30d': (30 * 24 * 3600, 12 * 3600),
+            '90d': (90 * 24 * 3600, 24 * 3600),
+        }
+        default_range_key = '12h'
+
+        def resolve_range_window(range_key: str) -> tuple[int, int]:
+            return range_windows.get(range_key, range_windows[default_range_key])
+
         @app.route('/api/downtime')
         def api_downtime():
-            # Query param 'range' accepts: '7d','3d','24h','1h'
-            range_key = request.args.get('range', '7d')
+            # Query param 'range' accepts keys from range_windows.
+            range_key = request.args.get('range', default_range_key)
             now = int(time.time())
-
-            if range_key == '7d':
-                total_seconds = 7 * 24 * 3600
-                bucket_size = 3600
-            elif range_key == '3d':
-                total_seconds = 3 * 24 * 3600
-                bucket_size = 3600
-            elif range_key == '24h':
-                total_seconds = 24 * 3600
-                bucket_size = 300
-            elif range_key == '1h':
-                total_seconds = 3600
-                bucket_size = 60
-            else:
-                # default
-                total_seconds = 7 * 24 * 3600
-                bucket_size = 3600
+            total_seconds, bucket_size = resolve_range_window(range_key)
 
             num_buckets = int(total_seconds // bucket_size)
             # build bucket boundaries: bucket i covers [start + i*bucket_size, start + (i+1)*bucket_size)
@@ -372,24 +371,9 @@ class AutoDeployService:
 
         @app.route('/api/deployments')
         def api_deployments():
-            range_key = request.args.get('range', '7d')
+            range_key = request.args.get('range', default_range_key)
             now = int(time.time())
-
-            if range_key == '7d':
-                total_seconds = 7 * 24 * 3600
-                bucket_size = 3600
-            elif range_key == '3d':
-                total_seconds = 3 * 24 * 3600
-                bucket_size = 3600
-            elif range_key == '24h':
-                total_seconds = 24 * 3600
-                bucket_size = 300
-            elif range_key == '1h':
-                total_seconds = 3600
-                bucket_size = 60
-            else:
-                total_seconds = 7 * 24 * 3600
-                bucket_size = 3600
+            total_seconds, bucket_size = resolve_range_window(range_key)
 
             num_buckets = int(total_seconds // bucket_size)
             start_ts = now - total_seconds

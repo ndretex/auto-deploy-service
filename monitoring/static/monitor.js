@@ -99,6 +99,27 @@ if (rangeSelect) {
   rangeSelect.addEventListener('change', () => refreshDeploymentsChart());
 }
 
+function formatRangeLabel(iso, rangeKey) {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+
+    const pad = (v) => String(v).padStart(2, '0');
+    const mm = pad(d.getMonth() + 1);
+    const dd = pad(d.getDate());
+    const hh = pad(d.getHours());
+    const min = pad(d.getMinutes());
+    const ss = pad(d.getSeconds());
+
+    if (rangeKey === '90d') return `${mm}-${dd}`;
+    if (rangeKey === '15d' || rangeKey === '30d') return `${mm}-${dd} ${hh}:${min}`;
+    if (rangeKey === '5m') return `${hh}:${min}:${ss}`;
+    return `${hh}:${min}`;
+  } catch (e) {
+    return iso;
+  }
+}
+
 async function fetchDowntime(rangeKey) {
   try {
     const res = await fetch(`/api/downtime?range=${encodeURIComponent(rangeKey)}`);
@@ -110,36 +131,13 @@ async function fetchDowntime(rangeKey) {
 }
 
 async function refreshDowntimeChart() {
-  const key = (rangeSelect && rangeSelect.value) || '7d';
+  const key = (rangeSelect && rangeSelect.value) || '12h';
   const payload = await fetchDowntime(key);
   if (!payload) return;
 
   const ctx = document.getElementById('downtime-chart').getContext('2d');
-
   const labels = payload.labels || [];
-  // Format labels into a more coherent, local date/time format depending on range
-  function formatLabel(iso, rangeKey) {
-    try {
-      const d = new Date(iso);
-      if (isNaN(d)) return iso;
-      const pad = (v) => String(v).padStart(2, '0');
-      if (rangeKey === '7d' || rangeKey === '3d') {
-        // show date and hour
-        const mm = pad(d.getMonth() + 1);
-        const dd = pad(d.getDate());
-        const hh = pad(d.getHours());
-        return `${mm}-${dd} ${hh}:00`;
-      }
-      // for 24h and 1h ranges show HH:MM
-      const hh = pad(d.getHours());
-      const min = pad(d.getMinutes());
-      return `${hh}:${min}`;
-    } catch (e) {
-      return iso;
-    }
-  }
-
-  const formattedLabels = labels.map((l) => formatLabel(l, key));
+  const formattedLabels = labels.map((l) => formatRangeLabel(l, key));
   const projects = payload.projects || {};
 
   const datasets = Object.keys(projects).map((name, idx) => {
@@ -194,33 +192,13 @@ async function fetchDeployments(rangeKey) {
 }
 
 async function refreshDeploymentsChart() {
-  const key = (rangeSelect && rangeSelect.value) || '7d';
+  const key = (rangeSelect && rangeSelect.value) || '12h';
   const payload = await fetchDeployments(key);
   if (!payload) return;
 
   const ctx = document.getElementById('deployments-chart').getContext('2d');
   const labels = payload.labels || [];
-
-  function formatLabel(iso, rangeKey) {
-    try {
-      const d = new Date(iso);
-      if (isNaN(d)) return iso;
-      const pad = (v) => String(v).padStart(2, '0');
-      if (rangeKey === '7d' || rangeKey === '3d') {
-        const mm = pad(d.getMonth() + 1);
-        const dd = pad(d.getDate());
-        const hh = pad(d.getHours());
-        return `${mm}-${dd} ${hh}:00`;
-      }
-      const hh = pad(d.getHours());
-      const min = pad(d.getMinutes());
-      return `${hh}:${min}`;
-    } catch (e) {
-      return iso;
-    }
-  }
-
-  const formattedLabels = labels.map((l) => formatLabel(l, key));
+  const formattedLabels = labels.map((l) => formatRangeLabel(l, key));
   const projects = payload.projects || {};
 
   const datasets = Object.keys(projects).map((name, idx) => {

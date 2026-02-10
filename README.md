@@ -83,8 +83,8 @@ The Flask app exposes the following endpoints:
 - `/` → `monitoring/templates/index.html` (status table, refresh button, downtime/deployment canvases).
 - `/static/monitor.js` → polls `/api/health`, formats ISO timestamps, and feeds Chart.js.
 - `/api/health` → current health status per project.
-- `/api/downtime?range=7d|3d|24h|1h` → downtime percentage buckets used by the downtime chart.
-- `/api/deployments?range=...` → deployment counts per bucket.
+- `/api/downtime?range=5m|15m|30m|3h|12h|15d|30d|90d` → downtime percentage buckets used by the downtime chart.
+- `/api/deployments?range=5m|15m|30m|3h|12h|15d|30d|90d` → deployment counts per bucket.
 
 Chart.js is loaded from `https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js`, the client refreshes every 30 seconds, and a manual refresh button pulls the latest health data. Dashboard auth is required and is read from `.env`.
 
