@@ -18,6 +18,12 @@ function renderTable(data) {
     const tr = document.createElement('tr');
     const nameTd = document.createElement('td');
     nameTd.textContent = name;
+    const portsTd = document.createElement('td');
+    if (Array.isArray(info.ports)) {
+      portsTd.textContent = info.ports.join(', ');
+    } else {
+      portsTd.textContent = info.ports || '-';
+    }
     const statusTd = document.createElement('td');
     statusTd.textContent = info.status || 'unknown';
     statusTd.className = info.status || 'unknown';
@@ -61,6 +67,7 @@ function renderTable(data) {
     }
     detailsTd.textContent = statusText;
     tr.appendChild(nameTd);
+    tr.appendChild(portsTd);
     tr.appendChild(statusTd);
     tr.appendChild(timeTd);
     tr.appendChild(detailsTd);

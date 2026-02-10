@@ -7,7 +7,7 @@ echo "=========================================="
 echo "Installing Auto-Deploy Service"
 echo "=========================================="
 
-SERVICE_DIR="/root/auto-deploy-service"
+SERVICE_DIR="/root/prod/auto-deploy-service"
 SERVICE_NAME="auto-deploy"
 
 # Check if running as root

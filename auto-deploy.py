@@ -6,6 +6,7 @@ and automatically deploys changes using configured deployment methods.
 """
 
 import os
+import re
 import sys
 import yaml
 import subprocess
@@ -13,6 +14,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 import time
 import requests
 try:
@@ -43,6 +45,8 @@ class AutoDeployService:
         self.deploy_history_retention_seconds = self.history_retention_seconds
         # Web server port (optional override in config.global.web_port)
         self.web_port = int(self.config.get('global', {}).get('web_port', 8000))
+        # Cached project port labels for monitoring table
+        self.project_ports = self.build_project_ports_map()
         # Docker client (optional): prefer SDK, fall back to shell commands
         self.docker_client = None
         if docker is not None:
@@ -115,6 +119,96 @@ class AutoDeployService:
             logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
             self.logger = logging.getLogger(__name__)
             self.logger.warning("Failed to initialize TimedRotatingFileHandler, using basic logging")
+
+
+    def _port_sort_key(self, value: str):
+        """Sort key for port labels so numeric values appear first."""
+        match = re.search(r'\d+', str(value))
+        if match:
+            return (0, int(match.group(0)), str(value))
+        return (1, 0, str(value))
+
+    def _format_ports(self, ports: List[str]) -> str:
+        cleaned = []
+        for port in ports:
+            if port is None:
+                continue
+            value = str(port).strip().strip('"').strip("'")
+            if not value:
+                continue
+            cleaned.append(value)
+        if not cleaned:
+            return 'n/a'
+        unique = sorted(set(cleaned), key=self._port_sort_key)
+        return ', '.join(unique)
+
+    def resolve_project_ports(self, project: Dict) -> str:
+        """Resolve displayable port labels for a project."""
+        explicit_ports = project.get('ports')
+        if explicit_ports:
+            if isinstance(explicit_ports, list):
+                return self._format_ports(explicit_ports)
+            return self._format_ports([explicit_ports])
+
+        ports: List[str] = []
+        health_cfg = project.get('health', {}) or {}
+        health_url = health_cfg.get('url')
+        if health_url:
+            try:
+                parsed = urlparse(health_url)
+                if parsed.port:
+                    ports.append(str(parsed.port))
+            except Exception:
+                pass
+
+        if project.get('name') == 'Auto Deploy Service':
+            ports.append(str(self.web_port))
+
+        if project.get('deploy_method') == 'docker-compose':
+            path = project.get('path')
+            if path and os.path.isdir(path):
+                success, output = self.run_command('docker compose config', cwd=path)
+                if success:
+                    try:
+                        compose_cfg = yaml.safe_load(output) or {}
+                        services = compose_cfg.get('services', {}) or {}
+                        for service_cfg in services.values():
+                            for port in service_cfg.get('ports', []) or []:
+                                if isinstance(port, str):
+                                    entry = port.strip()
+                                    if '/' in entry:
+                                        entry = entry.split('/', 1)[0]
+                                    ports.append(entry)
+                                elif isinstance(port, dict):
+                                    published = port.get('published')
+                                    target = port.get('target')
+                                    protocol = port.get('protocol')
+                                    if published is not None and target is not None:
+                                        entry = f'{published}:{target}'
+                                    elif published is not None:
+                                        entry = str(published)
+                                    elif target is not None:
+                                        entry = f'->{target}'
+                                    else:
+                                        continue
+                                    if protocol and protocol != 'tcp':
+                                        entry = f'{entry}/{protocol}'
+                                    ports.append(entry)
+                    except Exception:
+                        self.logger.exception(
+                            f"Failed to parse compose ports for {project.get('name', 'unknown')}"
+                        )
+
+        return self._format_ports(ports)
+
+    def build_project_ports_map(self) -> Dict[str, str]:
+        ports_map: Dict[str, str] = {}
+        for project in self.config.get('projects', []):
+            name = project.get('name')
+            if not name:
+                continue
+            ports_map[name] = self.resolve_project_ports(project)
+        return ports_map
 
     def create_flask_app(self) -> Flask:
         """Create Flask app and register routes for monitoring."""
@@ -268,6 +362,10 @@ class AutoDeployService:
         except Exception as e:
             self.logger.error(f"Failed to start web server: {e}")
 
+    def should_monitor_project(self, project: Dict) -> bool:
+        """Return True if project should appear in monitoring/status APIs."""
+        return project.get('enabled', True) or project.get('monitor_only', False)
+
     def start_health_scheduler(self):
         """Start a background thread that periodically updates health statuses."""
         def scheduler():
@@ -276,15 +374,19 @@ class AutoDeployService:
                 try:
                     projects = self.config.get('projects', [])
                     for project in projects:
-                        if not project.get('enabled', True):
+                        if not self.should_monitor_project(project):
                             continue
+                        project_name = project['name']
+                        if project_name not in self.project_ports:
+                            self.project_ports[project_name] = self.resolve_project_ports(project)
                         status = self.check_project_health(project)
+                        status['ports'] = self.project_ports.get(project_name, 'n/a')
                         with self.status_lock:
-                            self.statuses[project['name']] = status
+                            self.statuses[project_name] = status
                             # append history entry: timestamp seconds, is_unhealthy flag
                             ts = int(datetime.utcnow().timestamp())
                             is_unhealthy = (status.get('status') != 'healthy')
-                            hlist = self.history.setdefault(project['name'], [])
+                            hlist = self.history.setdefault(project_name, [])
                             hlist.append((ts, 1 if is_unhealthy else 0))
                             # prune old entries beyond retention
                             cutoff = ts - self.history_retention_seconds
@@ -339,6 +441,16 @@ class AutoDeployService:
                 candidates.add(f"{service}_1")
                 candidates.add(f"{service}-1")
 
+                def _matches_container(names: str, image: str = "") -> bool:
+                    if explicit_container:
+                        return names == explicit_container
+                    for cand in candidates:
+                        if not cand:
+                            continue
+                        if names == cand or cand in names or cand in image:
+                            return True
+                    return False
+
                 # Use Docker SDK if available for more reliable queries
                 def _parse_started_at(started_at: str) -> Optional[str]:
                     # Docker times are RFC3339 like: 2026-01-08T10:00:00.123456Z
@@ -391,15 +503,7 @@ class AutoDeployService:
                         except Exception:
                             image = str(getattr(c, 'image', ''))
 
-                        match = False
-                        for cand in candidates:
-                            if not cand:
-                                continue
-                            if names == cand or cand in names or cand in image:
-                                match = True
-                                break
-
-                        if match:
+                        if _matches_container(names, image):
                             found = c
                             break
 
@@ -433,15 +537,7 @@ class AutoDeployService:
                         continue
                     status_text, names, image = parts[0].strip(), parts[1].strip(), parts[2].strip()
 
-                    match = False
-                    for cand in candidates:
-                        if not cand:
-                            continue
-                        if names == cand or cand in names or cand in image:
-                            match = True
-                            break
-
-                    if match:
+                    if _matches_container(names, image):
                         found = (status_text, names)
                         break
 
