@@ -453,7 +453,7 @@ class AutoDeployService:
                         with self.status_lock:
                             self.statuses[project_name] = status
                             # append history entry: timestamp seconds, is_unhealthy flag
-                            ts = int(datetime.utcnow().timestamp())
+                            ts = int(datetime.now(timezone.utc).timestamp())
                             is_unhealthy = (status.get('status') != 'healthy')
                             hlist = self.history.setdefault(project_name, [])
                             hlist.append((ts, 1 if is_unhealthy else 0))
@@ -476,7 +476,7 @@ class AutoDeployService:
 
         Returns: {status: 'healthy'|'unhealthy'|'unknown', last_checked: ISO8601, details: str}
         """
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         try:
             # If explicit HTTP health check configured
             health_cfg = project.get('health', {})
@@ -537,7 +537,7 @@ class AutoDeployService:
                             dt = datetime.strptime(s, '%Y-%m-%dT%H:%M:%S')
                         except Exception:
                             return ''
-                    delta = datetime.utcnow() - dt
+                    delta = datetime.now(timezone.utc) - dt.replace(tzinfo=timezone.utc)
                     days = delta.days
                     secs = delta.seconds
                     hours = secs // 3600
